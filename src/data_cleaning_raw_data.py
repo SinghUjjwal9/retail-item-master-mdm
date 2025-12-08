@@ -23,8 +23,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 from flask import Flask, render_template_string, request, redirect, url_for
 from pyngrok import ngrok
 
-engine = create_engine("postgresql+psycopg2://postgres:mypassword@localhost:5432/postgres")
-
 
 # --- Install PostgreSQL & Python drivers ---
 !apt-get -y update
