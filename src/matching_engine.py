@@ -421,3 +421,19 @@ def process_new_item(new_item: dict, engine):
         "master_id": best_match_id,
         "score": best_score,
     }
+
+# For checking the code.
+
+new_item = {
+    "Store_Name": "StoreX",
+    "Store_Item_ID": "12345",
+    "POSCode": "STX-0001",
+    "ItemName": "CocaCola 1 Litre Bottle",  # similar name
+    "Brand": "Coca Cola",                   # similar brand
+    "PackSize": "1L",                       # same pack
+    "Category": "Beverages",
+}
+
+result = process_new_item(new_item, engine)
+print(result)
+
