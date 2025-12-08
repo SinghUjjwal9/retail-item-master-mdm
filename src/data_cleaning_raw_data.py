@@ -8,10 +8,6 @@ Original file is located at
 """
 
 # Installing important libraries & Importing from them.
-!apt-get -y install postgresql postgresql-contrib > /dev/null
-!service postgresql start
-!sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'mypassword';"
-!pg_isready
 !pip install rapidfuzz
 !pip install --upgrade pip
 !pip install rapidfuzz==3.6.1
@@ -20,7 +16,6 @@ import pandas as pd
 from rapidfuzz import fuzz
 import random
 import numpy as np
-from sqlalchemy import create_engine, text
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics.pairwise import cosine_similarity
@@ -28,44 +23,112 @@ from sklearn.metrics.pairwise import cosine_similarity
 from flask import Flask, render_template_string, request, redirect, url_for
 from pyngrok import ngrok
 
+engine = create_engine("postgresql+psycopg2://postgres:mypassword@localhost:5432/postgres")
+
+
+# --- Install PostgreSQL & Python drivers ---
+!apt-get -y update
+!apt-get -y install postgresql postgresql-contrib
+!pip install sqlalchemy psycopg[binary]
+
+# --- Start PostgreSQL service ---
+!service postgresql start
+
+# --- Configure PostgreSQL (create user + DB) ---
+# Default postgres user has no password; set your own here
+PG_USER = "colab_user"
+PG_PASS = "colab_pass"
+PG_DB   = "colab_db"
+
+# Create user and database
+!sudo -u postgres psql -c "DROP DATABASE IF EXISTS {PG_DB};"
+!sudo -u postgres psql -c "DROP ROLE IF EXISTS {PG_USER};"
+!sudo -u postgres psql -c "CREATE ROLE {PG_USER} WITH LOGIN PASSWORD '{PG_PASS}';"
+!sudo -u postgres psql -c "CREATE DATABASE {PG_DB} OWNER {PG_USER};"
+
+# --- SQLAlchemy engine setup ---
+from sqlalchemy import create_engine, text
+
+engine = create_engine(
+    f"postgresql+psycopg://{PG_USER}:{PG_PASS}@localhost:5432/{PG_DB}",
+    echo=True
+)
 # ============================================================
-# 1. I created and populated the rawitems table in PostgreSQL
+# 1. Create and populate the rawitems table in PostgreSQL
 # ============================================================
 
 def create_rawitems_table(engine):
     """
-    I created the rawitems table to store the original records exactly as they came from stores.
+    Create the rawitems table to store the original records exactly
+    as they came from stores (after minimal normalization of field names).
     """
     ddl = """
     DROP TABLE IF EXISTS rawitems;
 
     CREATE TABLE rawitems (
-        "Store_Name"   VARCHAR(20),
-        "Store_Item_ID" INT,
-        "POSCode"      VARCHAR(50),
-        "ItemName"     VARCHAR(255),
-        "Brand"        VARCHAR(100),
-        "PackSize"     VARCHAR(50),
-        "Category"     VARCHAR(100)
+        "Store_Name"     VARCHAR(20),
+        "Store_Item_ID"  VARCHAR(50),
+        "POSCode"        VARCHAR(50),
+        "ItemName"       VARCHAR(255),
+        "Brand"          VARCHAR(100),
+        "PackSize"       VARCHAR(50),
+        "Category"       VARCHAR(100)
     );
     """
     with engine.begin() as conn:
         conn.execute(text(ddl))
 
+# create the table
 create_rawitems_table(engine)
 
-# I combined all three store datasets and loaded them into rawitems.
+# Read raw CSVs from the three stores
+store1_df = pd.read_csv("/content/Store1_Messy_Retail_Data.csv")
+store2_df = pd.read_csv("/content/Store2_Messy_Retail_Data.csv")
+store3_df = pd.read_csv("/content/Store3_Messy_Retail_Data.csv")
+
+# Combine all store datasets
 all_stores = pd.concat([store1_df, store2_df, store3_df], ignore_index=True)
-all_stores.to_sql("rawitems", engine, if_exists="append", index=False)
+
+# --- FIX: Align DataFrame columns with rawitems table schema ---
+
+# 1) Rename StoreID -> Store_Name (this is what the table expects)
+if "StoreID" in all_stores.columns:
+    all_stores = all_stores.rename(columns={"StoreID": "Store_Name"})
+
+# 2) Create Store_Item_ID.
+#    Here we simply copy POSCode (as text) as the store-specific item id.
+all_stores["Store_Item_ID"] = all_stores["POSCode"].astype(str)
+
+# 3) Ensure all relevant columns exist and are strings
+for col in ["Store_Name", "POSCode", "ItemName", "Brand", "PackSize", "Category", "Store_Item_ID"]:
+    if col in all_stores.columns:
+        all_stores[col] = all_stores[col].astype(str)
+    else:
+        # If any column is missing, create it with empty strings
+        all_stores[col] = ""
+
+# 4) Insert only the columns that match the table definition,
+#    and in the same order.
+rawitems_cols = [
+    "Store_Name",
+    "Store_Item_ID",
+    "POSCode",
+    "ItemName",
+    "Brand",
+    "PackSize",
+    "Category",
+]
+
+all_stores[rawitems_cols].to_sql("rawitems", engine, if_exists="append", index=False)
 
 # ============================================================
-# 2. I built itemmaster_initial with cleaned attributes
+# 2. Build itemmaster_initial with cleaned attributes
 # ============================================================
 
 def build_itemmaster_initial(engine):
     """
-    I created the ItemMaster_Initial table with a surrogate raw_item_id and
-    added cleaned versions of key descriptive attributes.
+    Create the itemmaster_initial table with a surrogate raw_item_id and
+    cleaned versions of key descriptive attributes.
     """
     sql = """
     DROP TABLE IF EXISTS itemmaster_initial;
@@ -94,7 +157,7 @@ def build_itemmaster_initial(engine):
     with engine.begin() as conn:
         conn.execute(text(sql))
 
-    # I applied SQL-based cleaning to standardize the text fields.
+    # Apply SQL-based cleaning to standardize text fields
     cleaning_sql = r"""
     UPDATE itemmaster_initial
     SET
@@ -137,13 +200,13 @@ def build_itemmaster_initial(engine):
 build_itemmaster_initial(engine)
 
 # ============================================================
-# 3. I clustered items and built central_item_master
+# 3. Cluster items and build central_item_master
 # ============================================================
 
 def cluster_and_build_item_master(engine):
     """
-    I used TF-IDF and agglomerative clustering to group similar items
-    across stores into clusters and then used those clusters to build
+    Use TF-IDF and agglomerative clustering to group similar items
+    across stores into clusters and then use those clusters to build
     a central item master.
     """
     df = pd.read_sql("SELECT * FROM itemmaster_initial", engine)
@@ -156,7 +219,7 @@ def cluster_and_build_item_master(engine):
 
     def normalize_item_name(s: str) -> str:
         """
-        I normalized item names to reduce noise in clustering.
+        Normalize item names to reduce noise in clustering.
         """
         if not isinstance(s, str):
             return ""
@@ -166,7 +229,7 @@ def cluster_and_build_item_master(engine):
 
     df["normalized_name"] = df[clean_name_col].apply(normalize_item_name)
 
-    # I created a combined text field that included normalized name, brand, and pack size.
+    # Combined text: normalized item name + brand + pack size
     df["combined"] = (
         df["normalized_name"].fillna("")
         + " "
@@ -175,12 +238,12 @@ def cluster_and_build_item_master(engine):
         + df[clean_pack_col].fillna("")
     )
 
-    # I converted the combined text into TF-IDF vectors and computed cosine similarity.
+    # Convert combined text to TF-IDF vectors and compute cosine similarity
     tfidf = TfidfVectorizer().fit_transform(df["combined"])
     sim_matrix = cosine_similarity(tfidf)
     dist_matrix = 1 - sim_matrix
 
-    # I enforced hard blocking: items with different brand or pack size do not cluster together.
+    # Hard blocking: items with different brand OR pack size don't cluster together
     brand_arr = df[clean_brand_col].fillna("").values
     pack_arr = df[clean_pack_col].fillna("").values
 
@@ -191,7 +254,7 @@ def cluster_and_build_item_master(engine):
     dist_matrix[must_separate] = 1.0
     np.fill_diagonal(dist_matrix, 0.0)
 
-    # I ran agglomerative clustering on the precomputed distance matrix.
+    # Agglomerative clustering on precomputed distance matrix
     model = AgglomerativeClustering(
         n_clusters=None,
         metric="precomputed",
@@ -200,7 +263,7 @@ def cluster_and_build_item_master(engine):
     )
     df["clusterid"] = model.fit_predict(dist_matrix) + 1
 
-    # I derived a canonical category per cluster using majority voting.
+    # Derive canonical category per cluster (majority vote)
     def pick_canonical_category(group: pd.DataFrame) -> str:
         counts = group[clean_cat_col].value_counts(dropna=True)
         if len(counts) == 0:
@@ -216,7 +279,7 @@ def cluster_and_build_item_master(engine):
     df = df.merge(cluster_cat, on="clusterid", how="left")
     df[clean_cat_col] = df["cluster_category"]
 
-    # I enforced one master category per canonical brand.
+    # Enforce one master category per canonical brand
     df["canonical_brand"] = df[clean_brand_col]
 
     def pick_brand_master_category(group: pd.DataFrame) -> str:
@@ -234,21 +297,21 @@ def cluster_and_build_item_master(engine):
     df = df.merge(brand_cat, on="canonical_brand", how="left")
     df[clean_cat_col] = df["brand_master_category"]
 
-    # I created the item_master_clustered table to store cluster-level assignments.
+    # Create item_master_clustered table
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS item_master_clustered;"))
         conn.execute(
             text(
                 """
-            CREATE TABLE item_master_clustered (
-                clusterid        INT,
-                raw_item_id      INT,
-                clean_item_name  VARCHAR(255),
-                canonical_brand  VARCHAR(100),
-                clean_pack_size  VARCHAR(50),
-                clean_category   VARCHAR(100)
-            );
-        """
+                CREATE TABLE item_master_clustered (
+                    clusterid        INT,
+                    raw_item_id      INT,
+                    clean_item_name  VARCHAR(255),
+                    canonical_brand  VARCHAR(100),
+                    clean_pack_size  VARCHAR(50),
+                    clean_category   VARCHAR(100)
+                );
+                """
             )
         )
 
@@ -272,7 +335,7 @@ def cluster_and_build_item_master(engine):
     ]
     out.to_sql("item_master_clustered", engine, if_exists="append", index=False)
 
-    # I derived the central_item_master by collapsing each cluster into one master item.
+    # Derive central_item_master by collapsing each cluster to one master item
     clustered_sql = """
     DROP TABLE IF EXISTS central_item_master;
 
@@ -293,12 +356,12 @@ def cluster_and_build_item_master(engine):
 cluster_and_build_item_master(engine)
 
 # ============================================================
-# 4. I built review_queue and itemmapping tables
+# 4. Build review_queue and itemmapping tables
 # ============================================================
 
 def build_review_queue_and_mapping(engine):
     """
-    I created the review_queue for single-item clusters and the itemmapping table
+    Create the review_queue for single-item clusters and the itemmapping table
     to link raw items to their central master.
     """
     review_sql = """
